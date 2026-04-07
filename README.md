@@ -1,18 +1,3 @@
----
-title: Incident Response Environment
-emoji: 🚨
-colorFrom: red
-colorTo: orange
-sdk: docker
-pinned: false
-app_port: 8000
-tags:
-  - openenv
-  - reinforcement-learning
-  - sre
-  - incident-response
----
-
 # AI-Powered Incident Response Triage Environment
 
 An [OpenEnv](https://github.com/meta-pytorch/OpenEnv) environment that trains AI agents to triage and resolve production incidents. The agent plays the role of an on-call SRE, using investigation tools to find the root cause and apply the correct remediation.
