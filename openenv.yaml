@@ -1,0 +1,80 @@
+spec_version: 1
+name: incident_response_env
+display_name: "AI-Powered Incident Response Triage"
+description: >
+  A multi-task SRE simulation environment where AI agents triage, diagnose,
+  and resolve production incidents. Three tasks of increasing difficulty:
+  OOM heap exhaustion, bad deployment rollback, and cascading DB connection
+  leak. Features a 6-dimensional reward system with per-step signals,
+  live-evolving metrics, SLA clocks, and anti-pattern penalties.
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
+tasks:
+  - id: 1
+    name: oom-incident
+    description: "SEV2 - payment-service OOM heap exhaustion. Restart the correct service."
+    difficulty: easy
+    max_steps: 15
+
+  - id: 2
+    name: bad-deploy-incident
+    description: "SEV2 - api-gateway bad deploy causes NullPointerException. Identify and rollback."
+    difficulty: medium
+    max_steps: 15
+
+  - id: 3
+    name: cascade-incident
+    description: "SEV1 - order-service connection leak exhausts shared db-pool, 3 services down."
+    difficulty: hard
+    max_steps: 15
+
+action_space:
+  type: object
+  required: [tool]
+  properties:
+    tool:
+      type: string
+      enum:
+        - list_alerts
+        - query_logs
+        - query_metrics
+        - read_runbook
+        - check_deploy_history
+        - execute_remediation
+        - update_status
+        - declare_resolved
+    service:     {type: string}
+    severity:    {type: string}
+    keyword:     {type: string}
+    metric:      {type: string}
+    topic:       {type: string}
+    action_type: {type: string}
+    target:      {type: string}
+    message:     {type: string}
+    root_cause:  {type: string}
+
+observation_space:
+  type: object
+  properties:
+    content:    {type: string}
+    task_id:    {type: integer}
+    step_count: {type: integer}
+
+reward_range: [0.0, 1.0]
+
+reward_dimensions:
+  - name: situational_awareness
+    description: "Alert acknowledgement, blast radius mapping, investigation depth"
+  - name: diagnostic_quality
+    description: "Root cause identification, efficiency, red-herring resistance"
+  - name: remediation_quality
+    description: "Action correctness, ordering constraints, fix verification"
+  - name: time_efficiency
+    description: "MTTD/MTTR - live metrics degrade each step"
+  - name: communication
+    description: "Status update cadence and resolution accuracy"
+  - name: anti_patterns
+    description: "Penalties for blind remediations, circular queries, wrong-service actions"
