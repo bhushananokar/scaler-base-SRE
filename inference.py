@@ -41,13 +41,19 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "hf_placeholder")
 
-MAX_STEPS              = 15
 SUCCESS_SCORE_THRESHOLD = 0.50   # score >= this => success
 
 TASK_NAMES = {
     1: "oom-incident",
     2: "bad-deploy-incident",
     3: "cascade-incident",
+    4: "config-drift-incident",
+    5: "alert-storm-incident",
+}
+
+# Per-task step budgets (T5 is harder — allow more steps)
+TASK_MAX_STEPS = {
+    1: 15, 2: 15, 3: 15, 4: 15, 5: 20,
 }
 
 # ---------------------------------------------------------------------------
@@ -262,6 +268,7 @@ def call_llm(client: OpenAI, messages: list) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 def run_episode(client: OpenAI, task_id: int) -> dict:
     task_name = TASK_NAMES[task_id]
+    max_steps = TASK_MAX_STEPS.get(task_id, 15)
     log_start(task=task_name, model=MODEL_NAME)
 
     env = IncidentResponseEnvironment()
@@ -286,7 +293,7 @@ def run_episode(client: OpenAI, task_id: int) -> dict:
     last_error: Optional[str] = None
 
     try:
-        for step in range(1, MAX_STEPS + 1):
+        for step in range(1, max_steps + 1):
             if done:
                 break
 
@@ -382,12 +389,12 @@ def run_episode(client: OpenAI, task_id: int) -> dict:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="Incident Response — Baseline Inference")
-    parser.add_argument("--task_id", default="all", help="1, 2, 3, or 'all'")
+    parser.add_argument("--task_id", default="all", help="1, 2, 3, 4, 5, or 'all'")
     args = parser.parse_args()
 
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    task_ids = [1, 2, 3] if args.task_id == "all" else [int(args.task_id)]
+    task_ids = [1, 2, 3, 4, 5] if args.task_id == "all" else [int(args.task_id)]
 
     results = []
     for tid in task_ids:

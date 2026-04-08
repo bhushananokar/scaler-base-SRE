@@ -27,6 +27,8 @@ except ImportError:
 from src.oom_incident import OOMIncident
 from src.deploy_incident import DeployIncident
 from src.cascade_incident import CascadeIncident
+from src.config_drift_incident import ConfigDriftIncident
+from src.alert_storm_incident import AlertStormIncident
 
 
 def _make_incident(task_id: int, seed: int):
@@ -36,28 +38,39 @@ def _make_incident(task_id: int, seed: int):
         return DeployIncident(seed=seed)
     elif task_id == 3:
         return CascadeIncident(seed=seed)
-    raise ValueError(f"Unknown task_id {task_id}. Valid: 1, 2, 3")
+    elif task_id == 4:
+        return ConfigDriftIncident(seed=seed)
+    elif task_id == 5:
+        return AlertStormIncident(seed=seed)
+    raise ValueError(f"Unknown task_id {task_id}. Valid: 1–5")
 
 
 class IncidentResponseEnvironment(Environment):
     """
     AI-Powered Incident Response Triage Environment.
 
-    6-dimensional reward system with 23 signal components:
+    8-dimensional reward system with 29 signal components:
       D1 Situational Awareness  — alert ack, blast radius, investigation depth
       D2 Diagnostic Quality     — root cause ID, efficiency, coherence, red-herring resistance
       D3 Remediation Quality    — action correctness, ordering, collateral damage, fix verification
       D4 Time Efficiency        — MTTD, MTTR, SLA compliance
       D5 Communication          — update cadence, update quality, resolution accuracy
       D6 Anti-pattern Penalties — blind remediations, circular queries, red herring actions
+      D7 Epistemic Quality      — Bayesian belief entropy reduction, final confidence, redundancy
+      D8 Workflow Coherence     — SRE phase progression machine (OBSERVE→HYPOTHESIZE→DIAGNOSE→REMEDIATE→VERIFY)
 
     Per-step rewards: ~30% of total (immediate signal via observation.reward)
     Episode-end reward: ~70% of total (at done=True)
 
+    Observation fields include workflow_phase and epistemic_confidence so agents
+    can explicitly reason about their investigation state.
+
     Tasks:
-        task_id=1  Easy   — OOM in payment-service
-        task_id=2  Medium — Bad deploy (api-gateway) with two red herrings
-        task_id=3  Hard   — Cascading DB connection leak across 5 services
+        task_id=1  Easy        — OOM in payment-service
+        task_id=2  Medium      — Bad deploy (api-gateway) with two red herrings
+        task_id=3  Hard        — Cascading DB connection leak across 5 services
+        task_id=4  Medium-Hard — Config drift: TLS cert CN mismatch in checkout-service
+        task_id=5  Hard        — Alert storm: notification-service consumer deadlock (max 20 steps)
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -101,6 +114,10 @@ class IncidentResponseEnvironment(Environment):
         tool = (action.tool or "").strip().lower()
         result, step_reward = self._dispatch(tool, action)
 
+        # Collect epistemic + workflow state for observation
+        wf_phase = self._incident.workflow_machine.phase
+        ep_confidence = round(self._incident.belief_engine.confidence(), 4)
+
         done = self._incident.done
         if done:
             # Extract final score from reward breakdown text
@@ -112,6 +129,8 @@ class IncidentResponseEnvironment(Environment):
                 step_count=self._state.step_count,
                 done=True,
                 reward=final_reward,
+                workflow_phase=wf_phase,
+                epistemic_confidence=ep_confidence,
                 metadata={"tool": tool, "final": True},
             )
 
@@ -121,6 +140,8 @@ class IncidentResponseEnvironment(Environment):
             step_count=self._state.step_count,
             done=False,
             reward=round(step_reward, 4),
+            workflow_phase=wf_phase,
+            epistemic_confidence=ep_confidence,
             metadata={"tool": tool, "step_reward": round(step_reward, 4)},
         )
 

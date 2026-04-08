@@ -1,9 +1,11 @@
 """
-Enhanced BaseIncident — integrates RewardEngine + MetricEngine.
+Enhanced BaseIncident — integrates RewardEngine + MetricEngine + BeliefEngine + WorkflowMachine.
 
 Every incident subclass gets:
   - Live metrics that evolve each step (time pressure)
-  - Per-step rewards from the 6-dimensional reward engine
+  - Per-step rewards from the 8-dimensional reward engine
+  - Epistemic Bayesian reward signal (entropy reduction per investigation)
+  - SRE Workflow Coherence Machine rewards (phase transition bonuses/penalties)
   - SLA clock ticking during metric violations
   - Fix-verification detection
 """
@@ -15,6 +17,8 @@ from typing import Optional
 
 from .reward_engine import RewardEngine, IncidentConfig, RewardBreakdown
 from .metric_engine import MetricEngine
+from .belief_engine import BeliefEngine
+from .workflow_machine import WorkflowMachine
 
 
 @dataclass
@@ -31,7 +35,7 @@ class BaseIncident(ABC):
     Base class for incident scenarios.
 
     Subclasses must:
-      1. Call super().__init__(reward_engine, metric_engine, config)
+      1. Call super().__init__(reward_engine, metric_engine, config, belief_engine, workflow_machine)
       2. Implement all abstract methods
       3. Call self._record(tool, args, result, step_reward) to log actions
       4. Call self._after_fix(action, target) when a remediation is applied
@@ -42,11 +46,15 @@ class BaseIncident(ABC):
         reward_engine: RewardEngine,
         metric_engine: MetricEngine,
         config: IncidentConfig,
+        belief_engine: BeliefEngine,
+        workflow_machine: WorkflowMachine,
         seed: int = 42,
     ):
         self.reward_engine = reward_engine
         self.metric_engine = metric_engine
         self.config = config
+        self.belief_engine = belief_engine
+        self.workflow_machine = workflow_machine
         self.seed = seed
 
         self.step_count: int = 0
@@ -61,15 +69,29 @@ class BaseIncident(ABC):
     def _tick(self, tool: str, args: dict, step_number: int) -> float:
         """
         Called at the START of every tool dispatch.
-        Advances the metric engine, checks SLA, returns per-step reward delta.
+        Advances the metric engine, checks SLA, runs epistemic + workflow updates.
+        Returns total per-step reward delta.
         """
-        # 1. Reward engine: score this action
+        # 1. Reward engine: score this action (D1-D6 per-step signals)
         step_reward = self.reward_engine.on_action(tool, args, step_number)
 
-        # 2. Metric engine: evolve metrics one step
+        # 2. Belief engine: Bayesian update for investigation tools
+        if tool in ("query_logs", "query_metrics", "read_runbook", "check_deploy_history"):
+            epistemic_delta = self.belief_engine.update(tool, args)
+            step_reward += epistemic_delta
+        elif tool == "execute_remediation":
+            # Notify belief engine to track premature remediations
+            self.belief_engine.notify_remediation()
+
+        # 3. Workflow machine: phase transition rewards/penalties
+        is_correct = getattr(self.reward_engine, '_last_was_correct_action', False)
+        workflow_delta = self.workflow_machine.on_action(tool, args, is_correct_action=is_correct)
+        step_reward += workflow_delta
+
+        # 4. Metric engine: evolve metrics one step
         self.metric_engine.tick()
 
-        # 3. SLA check: add penalty if currently violated.
+        # 5. SLA check: add penalty if currently violated.
         #    Skip terminal step so sla_violation_steps never exceeds total_steps.
         if tool != "declare_resolved" and not self.metric_engine.is_sla_ok():
             step_reward += self.reward_engine.on_sla_violation_step()

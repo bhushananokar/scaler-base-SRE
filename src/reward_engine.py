@@ -1,7 +1,7 @@
 """
 reward_engine.py
 ================
-6-dimensional reward system with 23 individual signal components for
+8-dimensional reward system with 29 individual signal components for
 incident response agent training.
 
 Architecture
@@ -18,14 +18,21 @@ D3  Remediation Quality     (action correctness, ordering, collateral damage, fi
 D4  Time Efficiency         (MTTD, MTTR, SLA compliance)
 D5  Communication           (update cadence, update quality, resolution accuracy)
 D6  Anti-pattern Penalties  (blind remediations, circular queries, red herring actions, unresolved)
+D7  Epistemic Quality       (cumulative entropy reduction, final belief confidence, redundancy)
+D8  Workflow Coherence      (phase progression, verify-before-resolve bonus)
 
 No external dependencies — standard library + dataclasses + typing only.
+BeliefEngine and WorkflowMachine are passed into compute_final_reward at episode end.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .belief_engine import BeliefEngine
+    from .workflow_machine import WorkflowMachine
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +60,22 @@ class IncidentConfig:
     # Ordering constraints: list of (i, j) meaning golden_actions[i] must come before golden_actions[j]
     action_order_constraints: list[tuple[int, int]]
 
-    # Per-dimension weight budget (6 keys required)
-    # Keys: situational, diagnostic, remediation, time, communication, anti_patterns
+    # Per-dimension weight budget (8 keys required)
+    # Keys: situational, diagnostic, remediation, time, communication, anti_patterns,
+    #       epistemic_quality, workflow_coherence
     weights: dict[str, float]
 
     # Which service + metric defines business SLA
     sla_service: str
     sla_metric: str                          # "error_rate", "latency_p99", etc.
+
+    # Epistemic fields (populated per-task)
+    hypothesis_space: list[str] = field(default_factory=list)
+    likelihood_table: dict[str, dict[str, float]] = field(default_factory=dict)
+    true_hypothesis: str = ""
+
+    # Episode length cap (default 15; harder tasks may use 20)
+    max_steps: int = 15
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +93,8 @@ class RewardBreakdown:
     time_efficiency: float = 0.0
     communication: float = 0.0
     anti_patterns: float = 0.0      # will be <= 0
+    epistemic_quality: float = 0.0
+    workflow_coherence: float = 0.0
 
     # Line-item detail
     components: dict[str, float] = field(default_factory=dict)
@@ -95,6 +113,8 @@ class RewardBreakdown:
             + self.time_efficiency
             + self.communication
             + self.anti_patterns   # negative
+            + self.epistemic_quality
+            + self.workflow_coherence
         )
         return max(0.0, min(1.0, raw))
 
@@ -193,6 +213,26 @@ class RewardBreakdown:
         lines.append(f"  unresolved_penalty:     {p('unresolved_penalty'):.3f}")
         lines.append("")
 
+        # ---- D7 ----
+        d7_max = self.components.get("_d7_max", 0.0)
+        lines.append(f"[D7] Epistemic Quality:         {self.epistemic_quality:.3f} / {d7_max:.3f}")
+        lines.append(f"  cumulative_epistemic_gain: +{c('cumulative_epistemic_gain'):.3f}  "
+                     f"(total entropy reduction: {self.components.get('_cum_gain_raw', 0.0):.4f})")
+        lines.append(f"  final_belief_confidence: +{c('final_belief_confidence'):.3f}  "
+                     f"(probability on true hypothesis: {self.components.get('_true_conf', 0.0):.2f})")
+        lines.append(f"  redundancy_penalty:     +{c('redundancy_penalty'):.3f}  "
+                     f"(redundant query ratio: {self.components.get('_redundancy_ratio', 0.0):.2f})")
+        lines.append("")
+
+        # ---- D8 ----
+        d8_max = self.components.get("_d8_max", 0.0)
+        lines.append(f"[D8] Workflow Coherence:        {self.workflow_coherence:.3f} / {d8_max:.3f}")
+        lines.append(f"  phase_progression:      +{c('phase_progression'):.3f}  "
+                     f"(phases: {self.components.get('_phase_summary', '?')})")
+        lines.append(f"  verify_bonus:           +{c('verify_bonus'):.3f}  "
+                     f"({'verified before resolve' if c('verify_bonus') > 0 else 'did NOT verify before resolve'})")
+        lines.append("")
+
         # Narrative hints
         for hint in self._narrative_hints:
             lines.append(hint)
@@ -218,7 +258,8 @@ class RewardEngine:
     # After a correct remediation, when metrics are re-queried:
     engine.mark_fix_verified()
     # At episode end:
-    score, breakdown = engine.compute_final_reward(root_cause_str, total_steps)
+    score, breakdown = engine.compute_final_reward(root_cause_str, total_steps,
+                                                    belief_engine, workflow_machine)
     """
 
     def __init__(self, config: IncidentConfig) -> None:
@@ -260,6 +301,9 @@ class RewardEngine:
         # Internal: track first step a relevant service was investigated
         self._first_relevant_inv_step: Optional[int] = None
 
+        # Internal: flag set during on_action for WorkflowMachine
+        self._last_was_correct_action: bool = False
+
     # -----------------------------------------------------------------------
     # Per-step methods
     # -----------------------------------------------------------------------
@@ -273,6 +317,7 @@ class RewardEngine:
         """
         self.total_steps += 1
         self.step_count += 1
+        self._last_was_correct_action = False
         delta: float = 0.0
 
         # ---- list_alerts ----
@@ -348,6 +393,7 @@ class RewardEngine:
                     if self.first_correct_action_step is None:
                         self.first_correct_action_step = step_number
                     matched = True
+                    self._last_was_correct_action = True
                     delta = 0.02
                     break
 
@@ -408,16 +454,22 @@ class RewardEngine:
         self,
         root_cause: str,
         total_steps: int,
+        belief_engine: "Optional[BeliefEngine]" = None,
+        workflow_machine: "Optional[WorkflowMachine]" = None,
     ) -> tuple[float, RewardBreakdown]:
         """
-        Compute all episode-end rewards.
+        Compute all episode-end rewards including D7 (Epistemic Quality) and D8 (Workflow Coherence).
 
         Parameters
         ----------
         root_cause : str
             The root-cause string supplied in declare_resolved.
         total_steps : int
-            Total number of steps in the episode (used for timing metrics).
+            Total number of steps in the episode.
+        belief_engine : BeliefEngine, optional
+            For D7 computation.
+        workflow_machine : WorkflowMachine, optional
+            For D8 computation. Also gates fix_verification via skipped_verify flag.
 
         Returns
         -------
@@ -429,16 +481,18 @@ class RewardEngine:
         bd = RewardBreakdown()
 
         # Store max budgets for feedback display
-        bd.components["_d1_max"] = w.get("situational", 0.15)
-        bd.components["_d2_max"] = w.get("diagnostic", 0.25)
+        bd.components["_d1_max"] = w.get("situational", 0.11)
+        bd.components["_d2_max"] = w.get("diagnostic", 0.19)
         bd.components["_d3_max"] = w.get("remediation", 0.25)
-        bd.components["_d4_max"] = w.get("time", 0.15)
+        bd.components["_d4_max"] = w.get("time", 0.10)
         bd.components["_d5_max"] = w.get("communication", 0.10)
+        bd.components["_d7_max"] = w.get("epistemic_quality", 0.08)
+        bd.components["_d8_max"] = w.get("workflow_coherence", 0.07)
 
         # ----------------------------------------------------------------
         # D1 — Situational Awareness
         # ----------------------------------------------------------------
-        d1_max = w.get("situational", 0.15)
+        d1_max = w.get("situational", 0.11)
 
         # alert_ack (20% of D1)
         if self.alert_ack_step is not None:
@@ -475,7 +529,7 @@ class RewardEngine:
         # ----------------------------------------------------------------
         # D2 — Diagnostic Quality
         # ----------------------------------------------------------------
-        d2_max = w.get("diagnostic", 0.25)
+        d2_max = w.get("diagnostic", 0.19)
 
         # root_cause_id (40% of D2)
         root_cause_lower = root_cause.lower()
@@ -499,15 +553,6 @@ class RewardEngine:
         inv_eff_score = inv_eff_ratio * 0.20 * d2_max
 
         # hypothesis_coherence (20% of D2): was root_cause_service investigated before any remediation?
-        first_action_step = None
-        if self.actions_taken:
-            # We don't store per-action steps; use first_correct_action_step as proxy,
-            # but we need to know if root_cause_service was queried before any remediation.
-            # We track investigation_steps count; if root_cause_service is in
-            # relevant_services_investigated and first_relevant_inv_step <= first remediation,
-            # we consider it coherent.
-            first_action_step = self.first_correct_action_step
-
         rcs_investigated_before_fix = (
             cfg.root_cause_service in self.relevant_services_investigated
             and (
@@ -554,7 +599,6 @@ class RewardEngine:
         else:
             satisfied = 0
             for (i, j) in cfg.action_order_constraints:
-                # Find the positions in actions_taken that correspond to golden_actions[i] and [j]
                 pos_i = _find_golden_action_position(cfg.golden_actions[i], self.actions_taken)
                 pos_j = _find_golden_action_position(cfg.golden_actions[j], self.actions_taken)
                 if pos_i is not None and pos_j is not None and pos_i < pos_j:
@@ -568,7 +612,9 @@ class RewardEngine:
         collateral_score = max(0.0, 1.0 - 0.3 * self.wrong_actions_count) * 0.20 * d3_max
 
         # fix_verification (20% of D3)
-        fv_score = (1.0 if self.fix_verified else 0.0) * 0.20 * d3_max
+        # If workflow machine says the agent skipped verify, zero out fix_verification
+        skipped_verify = workflow_machine.skipped_verify if workflow_machine else False
+        fv_score = (1.0 if (self.fix_verified and not skipped_verify) else 0.0) * 0.20 * d3_max
 
         bd.remediation = action_correctness_score + ordering_score + collateral_score + fv_score
         bd.components["action_correctness"] = action_correctness_score
@@ -583,7 +629,7 @@ class RewardEngine:
         # ----------------------------------------------------------------
         # D4 — Time Efficiency
         # ----------------------------------------------------------------
-        d4_max = w.get("time", 0.15)
+        d4_max = w.get("time", 0.10)
 
         # mttd (35% of D4): steps to first relevant service investigation
         if self._first_relevant_inv_step is not None:
@@ -606,7 +652,6 @@ class RewardEngine:
 
         # sla_compliance (30% of D4)
         effective_total = max(1, total_steps)
-        # Cap violations at total_steps to prevent > 100% violation ratio
         capped_violations = min(self.sla_violation_steps, effective_total)
         sla_comp_frac = 1.0 - (capped_violations / effective_total)
         sla_compliance_score = max(0.0, sla_comp_frac) * 0.30 * d4_max
@@ -635,7 +680,7 @@ class RewardEngine:
             cadence_frac = 1.0
         cadence_score = cadence_frac * 0.50 * d5_max
 
-        # update_quality (30% of D5): fraction of updates mentioning relevant service or root_cause_type
+        # update_quality (30% of D5)
         if n_updates > 0:
             quality_keywords = list(cfg.relevant_services) + [cfg.root_cause_type]
             quality_count = sum(
@@ -666,7 +711,7 @@ class RewardEngine:
         # ----------------------------------------------------------------
         # D6 — Anti-pattern Penalties
         # ----------------------------------------------------------------
-        ap_cap = w.get("anti_patterns", 0.10)  # max absolute penalty budget
+        ap_cap = w.get("anti_patterns", 0.10)
 
         blind_pen = min(0.06, 0.03 * self.remediations_before_investigation)
         circular_pen = min(0.04, 0.01 * self.circular_query_count)
@@ -681,6 +726,62 @@ class RewardEngine:
         bd.penalties["circular_queries"] = -circular_pen
         bd.penalties["red_herring_actions"] = -rh_action_pen
         bd.penalties["unresolved_penalty"] = -unresolved_pen
+
+        # ----------------------------------------------------------------
+        # D7 — Epistemic Quality
+        # ----------------------------------------------------------------
+        d7_max = w.get("epistemic_quality", 0.08)
+
+        if belief_engine is not None:
+            cum_gain = belief_engine.cumulative_gain()
+            n_hyp = max(2, len(belief_engine.hypothesis_space))
+            # Normalize: max possible is ~0.04 * n_hyp (one high-gain query per hypothesis)
+            gain_norm = min(1.0, cum_gain / (0.04 * n_hyp))
+            cum_gain_score = gain_norm * 0.40 * d7_max
+
+            true_conf = belief_engine.final_confidence_on_true()
+            true_conf_score = true_conf * 0.40 * d7_max
+
+            redundancy_ratio = belief_engine.redundancy_ratio()
+            # Penalty scales from 0 (no redundancy) to -0.20*d7_max (all queries redundant)
+            redundancy_score = max(0.0, 1.0 - redundancy_ratio * 2.0) * 0.20 * d7_max
+
+            bd.epistemic_quality = cum_gain_score + true_conf_score + redundancy_score
+            bd.components["cumulative_epistemic_gain"] = cum_gain_score
+            bd.components["final_belief_confidence"] = true_conf_score
+            bd.components["redundancy_penalty"] = redundancy_score
+            bd.components["_cum_gain_raw"] = cum_gain
+            bd.components["_true_conf"] = true_conf
+            bd.components["_redundancy_ratio"] = redundancy_ratio
+        else:
+            bd.epistemic_quality = 0.0
+            bd.components["cumulative_epistemic_gain"] = 0.0
+            bd.components["final_belief_confidence"] = 0.0
+            bd.components["redundancy_penalty"] = 0.0
+            bd.components["_cum_gain_raw"] = 0.0
+            bd.components["_true_conf"] = 0.0
+            bd.components["_redundancy_ratio"] = 0.0
+
+        # ----------------------------------------------------------------
+        # D8 — Workflow Coherence
+        # ----------------------------------------------------------------
+        d8_max = w.get("workflow_coherence", 0.07)
+
+        if workflow_machine is not None:
+            prog = workflow_machine.phase_progression_score()  # 0.0–1.0
+            phase_prog_score = prog * 0.50 * d8_max
+
+            verify_bonus = (0.50 * d8_max) if workflow_machine.verify_before_resolve() else 0.0
+
+            bd.workflow_coherence = phase_prog_score + verify_bonus
+            bd.components["phase_progression"] = phase_prog_score
+            bd.components["verify_bonus"] = verify_bonus
+            bd.components["_phase_summary"] = workflow_machine.phases_summary()
+        else:
+            bd.workflow_coherence = 0.0
+            bd.components["phase_progression"] = 0.0
+            bd.components["verify_bonus"] = 0.0
+            bd.components["_phase_summary"] = "N/A"
 
         # ----------------------------------------------------------------
         # Narrative hints
@@ -704,6 +805,10 @@ class RewardEngine:
             hints.append(
                 f"Warning: {self.remediations_before_investigation} remediation(s) applied before any investigation."
             )
+        if workflow_machine and workflow_machine.skipped_verify:
+            hints.append("Tip: reach the VERIFY phase (query metrics after fix) before declaring resolved.")
+        if belief_engine and belief_engine.redundancy_ratio() > 0.3:
+            hints.append("Tip: avoid querying the same service repeatedly — each query should reveal new information.")
         bd._narrative_hints = hints
 
         # ----------------------------------------------------------------
@@ -716,6 +821,8 @@ class RewardEngine:
             + bd.time_efficiency
             + bd.communication
             + bd.anti_patterns
+            + bd.epistemic_quality
+            + bd.workflow_coherence
         )
         final_score = round(max(0.0, min(1.0, episode_score)), 3)
         return final_score, bd

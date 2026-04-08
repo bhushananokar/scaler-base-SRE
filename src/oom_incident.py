@@ -4,10 +4,12 @@ Task 1: OOM Restart (Easy)
 Scenario: payment-service has an unbounded TransactionCache that leaks memory.
 Memory grows ~1.8%/step. At 100% the JVM crashes and downstream errors cascade.
 
-Red herrings:
-  - Recent deploy on payment-service v3.8.2 (looks suspicious, but it's fine — the leak
-    is a pre-existing bug exposed by today's traffic spike)
-  - api-gateway has a minor CPU alert (unrelated, flapping due to health checks)
+Red herrings (strengthened):
+  - api-gateway shows elevated CPU (68%) AND elevated latency (1850ms) in metrics —
+    looks like a candidate for 1-2 investigation steps until logs show no errors.
+  - payment-service v3.8.2 WARN log mentions "TransactionCache warm-start (eviction=disabled)"
+    making the deploy look like the trigger — but the runbook reveals eviction was disabled
+    in v3.7.0 (2 weeks earlier), not in this deploy.
 
 Optimal path (5–7 steps):
   list_alerts -> query_logs(payment-service, error) -> read_runbook(payment-service)
@@ -20,6 +22,11 @@ IncidentConfig golden actions: [("restart", "payment-service")]
 from .incident_base import BaseIncident
 from .reward_engine import RewardEngine, IncidentConfig
 from .metric_engine import make_oom_metric_engine
+from .belief_engine import (
+    BeliefEngine,
+    OOM_HYPOTHESIS_SPACE, OOM_TRUE_HYPOTHESIS, OOM_LIKELIHOOD_TABLE,
+)
+from .workflow_machine import WorkflowMachine
 
 # ---------------------------------------------------------------------------
 # Static data: alerts, logs, runbooks, deploy history
@@ -49,6 +56,8 @@ _LOGS = {
             "[WARN]  2024-01-15 14:31:30 payment-service Memory 94% - approaching limit\n"
             "[WARN]  2024-01-15 14:30:10 payment-service TransactionCache growing unexpectedly: 892MB (limit 1024MB)\n"
             "[WARN]  2024-01-15 14:28:55 payment-service Cache eviction disabled since v3.7.0 (config change)\n"
+            "[WARN]  2024-01-15 14:27:58 payment-service v3.8.2 startup: TransactionCache warm-start enabled "
+            "(eviction=disabled) — cache size will grow under high traffic\n"
         ),
         "all": (
             "[ERROR] 2024-01-15 14:32:01 payment-service java.lang.OutOfMemoryError: Java heap space\n"
@@ -57,18 +66,28 @@ _LOGS = {
             "[WARN]  2024-01-15 14:31:30 payment-service Memory 94% and rising\n"
             "[WARN]  2024-01-15 14:28:55 payment-service Cache eviction disabled since v3.7.0\n"
             "[INFO]  2024-01-15 14:28:00 payment-service Processing 2,340 txns/min (above average traffic)\n"
-            "[INFO]  2024-01-15 14:27:55 payment-service Startup OK (v3.8.2) - TransactionCache warm start\n"
+            "[WARN]  2024-01-15 14:27:58 payment-service v3.8.2 startup: TransactionCache warm-start enabled "
+            "(eviction=disabled) — cache size will grow under high traffic\n"
+            "[INFO]  2024-01-15 14:27:55 payment-service Startup OK (v3.8.2)\n"
         ),
     },
     "api-gateway": {
         "all": (
-            "[INFO]  2024-01-15 14:32:10 api-gateway All routes healthy\n"
-            "[WARN]  2024-01-15 14:31:55 api-gateway CPU 68% (health check storms from k8s)\n"
-            "[INFO]  2024-01-15 14:31:40 api-gateway payment-service latency degraded - slow responses upstream\n"
-            "[INFO]  2024-01-15 14:30:00 api-gateway All other routes nominal\n"
+            "[INFO]  2024-01-15 14:32:10 api-gateway All routes nominally healthy — no request errors\n"
+            "[WARN]  2024-01-15 14:31:55 api-gateway CPU 68% (health check storms from k8s — expected)\n"
+            "[WARN]  2024-01-15 14:31:50 api-gateway p99 latency 1850ms — elevated due to slow upstream: payment-service\n"
+            "[INFO]  2024-01-15 14:31:40 api-gateway payment-service route p99 latency: 1850ms (upstream degraded)\n"
+            "[INFO]  2024-01-15 14:30:00 api-gateway All other routes nominal. No api-gateway errors.\n"
         ),
-        "error": "No error logs for api-gateway. CPU alert is due to k8s health check storms.\n",
-        "warn": "[WARN] 2024-01-15 14:31:55 api-gateway CPU 68% - health check frequency elevated\n",
+        "error": (
+            "No error logs for api-gateway.\n"
+            "NOTE: CPU 68% and elevated latency (1850ms) are SECONDARY EFFECTS of payment-service degradation,\n"
+            "not an api-gateway root cause. Health check storms are expected k8s behavior.\n"
+        ),
+        "warn": (
+            "[WARN] 2024-01-15 14:31:55 api-gateway CPU 68% - health check frequency elevated (k8s)\n"
+            "[WARN] 2024-01-15 14:31:50 api-gateway p99 latency 1850ms - upstream payment-service slow\n"
+        ),
     },
     "user-service": {
         "all": "[INFO] 2024-01-15 14:32:10 user-service Normal operation. No issues.\n",
@@ -157,13 +176,18 @@ OOM_CONFIG = IncidentConfig(
     golden_actions=[("restart", "payment-service")],
     action_order_constraints=[],  # only one action needed
     weights={
-        "situational": 0.10,
-        "diagnostic": 0.20,
+        "situational": 0.06,      # reduced by 0.04 (D7 measures investigation quality more precisely)
+        "diagnostic": 0.14,       # reduced by 0.06 (D7 captures belief confidence better)
         "remediation": 0.35,
-        "time": 0.15,
+        "time": 0.10,             # reduced by 0.05 (D8 captures ordering quality)
         "communication": 0.10,
         "anti_patterns": 0.10,
+        "epistemic_quality": 0.08,
+        "workflow_coherence": 0.07,
     },
+    hypothesis_space=OOM_HYPOTHESIS_SPACE,
+    likelihood_table=OOM_LIKELIHOOD_TABLE,
+    true_hypothesis=OOM_TRUE_HYPOTHESIS,
     sla_service="payment-service",
     sla_metric="error_rate",
 )
@@ -178,7 +202,9 @@ class OOMIncident(BaseIncident):
     def __init__(self, seed: int = 42):
         engine = RewardEngine(OOM_CONFIG)
         metrics = make_oom_metric_engine()
-        super().__init__(engine, metrics, OOM_CONFIG, seed)
+        belief = BeliefEngine(OOM_HYPOTHESIS_SPACE, OOM_LIKELIHOOD_TABLE, OOM_TRUE_HYPOTHESIS)
+        workflow = WorkflowMachine(root_cause_service="payment-service")
+        super().__init__(engine, metrics, OOM_CONFIG, belief, workflow, seed)
         self._service_restarted = False
 
     def get_task_id(self) -> int:
@@ -305,7 +331,7 @@ class OOMIncident(BaseIncident):
         step_reward = self._tick("declare_resolved", args, self.step_count)
 
         final_score, breakdown = self.reward_engine.compute_final_reward(
-            root_cause, self.step_count
+            root_cause, self.step_count, self.belief_engine, self.workflow_machine
         )
         feedback = breakdown.to_feedback()
         self.done = True

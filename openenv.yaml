@@ -3,10 +3,14 @@ name: incident_response_env
 display_name: "AI-Powered Incident Response Triage"
 description: >
   A multi-task SRE simulation environment where AI agents triage, diagnose,
-  and resolve production incidents. Three tasks of increasing difficulty:
-  OOM heap exhaustion, bad deployment rollback, and cascading DB connection
-  leak. Features a 6-dimensional reward system with per-step signals,
-  live-evolving metrics, SLA clocks, and anti-pattern penalties.
+  and resolve production incidents. Five tasks of increasing difficulty:
+  OOM heap exhaustion, bad deployment rollback, cascading DB connection
+  leak, TLS certificate CN mismatch (config drift), and alert storm from
+  a consumer deadlock. Features an 8-dimensional reward system with per-step
+  signals, live-evolving metrics, SLA clocks, anti-pattern penalties, an
+  Epistemic Bayesian Reward Signal (D7) that scores entropy reduction over
+  root cause hypotheses, and an SRE Workflow Coherence Machine (D8) that
+  rewards methodical phase progression through OBSERVE→HYPOTHESIZE→DIAGNOSE→REMEDIATE→VERIFY.
 type: space
 runtime: fastapi
 app: server.app:app
@@ -30,6 +34,18 @@ tasks:
     description: "SEV1 - order-service connection leak exhausts shared db-pool, 3 services down."
     difficulty: hard
     max_steps: 15
+
+  - id: 4
+    name: config-drift-incident
+    description: "SEV2 - TLS cert CN mismatch: payments-gateway cert rotated, checkout-service config stale."
+    difficulty: medium-hard
+    max_steps: 15
+
+  - id: 5
+    name: alert-storm-incident
+    description: "SEV1 - 11 alerts: notification-service v2.8.0 deadlock fills message-queue; 4 producers back up."
+    difficulty: hard
+    max_steps: 20
 
 action_space:
   type: object
@@ -59,9 +75,13 @@ action_space:
 observation_space:
   type: object
   properties:
-    content:    {type: string}
-    task_id:    {type: integer}
-    step_count: {type: integer}
+    content:               {type: string}
+    task_id:               {type: integer}
+    step_count:            {type: integer}
+    workflow_phase:        {type: string, nullable: true,
+                            description: "Current SRE investigation phase: OBSERVE | HYPOTHESIZE | DIAGNOSE | REMEDIATE | VERIFY"}
+    epistemic_confidence:  {type: number, nullable: true,
+                            description: "Probability mass on top root cause hypothesis (0.0–1.0). Remediate when >= 0.65."}
 
 reward_range: [0.0, 1.0]
 
@@ -78,3 +98,7 @@ reward_dimensions:
     description: "Status update cadence and resolution accuracy"
   - name: anti_patterns
     description: "Penalties for blind remediations, circular queries, wrong-service actions"
+  - name: epistemic_quality
+    description: "Bayesian belief entropy reduction over root cause hypotheses per investigation step — rewards actions that sharpen uncertainty most efficiently"
+  - name: workflow_coherence
+    description: "SRE Workflow Coherence Machine — rewards adherence to OBSERVE→HYPOTHESIZE→DIAGNOSE→REMEDIATE→VERIFY phase sequence"

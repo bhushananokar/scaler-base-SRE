@@ -102,3 +102,19 @@ class IncidentObservation(Observation):
         default=0,
         description="Number of steps taken in the current episode",
     )
+    workflow_phase: Optional[str] = Field(
+        default=None,
+        description=(
+            "Current SRE investigation phase from the Workflow Coherence Machine. "
+            "One of: OBSERVE, HYPOTHESIZE, DIAGNOSE, REMEDIATE, VERIFY. "
+            "Advance through all phases in order for full workflow_coherence score."
+        ),
+    )
+    epistemic_confidence: Optional[float] = Field(
+        default=None,
+        description=(
+            "Probability mass on the current top root cause hypothesis (0.0–1.0). "
+            "Reaches 1.0 when belief is fully concentrated. "
+            "Prefer remediating only when this is >= 0.65."
+        ),
+    )

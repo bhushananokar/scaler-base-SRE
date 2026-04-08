@@ -25,6 +25,11 @@ IncidentConfig golden actions: [("rollback", "api-gateway")]
 from .incident_base import BaseIncident
 from .reward_engine import RewardEngine, IncidentConfig
 from .metric_engine import make_deploy_metric_engine
+from .belief_engine import (
+    BeliefEngine,
+    DEPLOY_HYPOTHESIS_SPACE, DEPLOY_TRUE_HYPOTHESIS, DEPLOY_LIKELIHOOD_TABLE,
+)
+from .workflow_machine import WorkflowMachine
 
 _INITIAL_ALERTS = """
 === FIRING ALERTS ===
@@ -63,14 +68,28 @@ _LOGS = {
         ),
     },
     "user-service": {
-        "error": "No errors in user-service. v1.5.0 is healthy — only read-only cache changes.\n",
-        "warn": "No warnings in user-service.\n",
+        # Strengthened red herring: v1.5.0 cache refresh looks suspicious on first glance.
+        # Agent must check deploy history (timing mismatch) or read runbook to dismiss it.
+        "error": (
+            "[ERROR] 2024-01-15 15:47:20 user-service RouteCache invalidation spike: 847 cache misses in 60s\n"
+            "    at com.users.cache.RouteCache.invalidate(RouteCache.java:88)\n"
+            "    com.users.cache.RouteCache: aggressive refresh triggered by v1.5.0 startup\n"
+            "[WARN]  2024-01-15 15:47:18 user-service v1.5.0: aggressive cache refresh on startup "
+            "may cause temporary upstream pressure (expected, resolves in <2 min)\n"
+            "NOTE: These are cache warm-up events, not request errors. "
+            "user-service health checks all PASSING. Error rate: 0.03%.\n"
+        ),
+        "warn": (
+            "[WARN] 2024-01-15 15:47:18 user-service v1.5.0 startup cache refresh: 847 invalidations (expected)\n"
+            "[WARN] 2024-01-15 15:03:22 user-service v1.5.0 deployment: cache-aggressive-refresh=true (config)\n"
+        ),
         "all": (
-            "[INFO] 2024-01-15 15:47:15 user-service 1,204 profile requests processed (normal)\n"
-            "[INFO] 2024-01-15 15:47:10 user-service All health checks passing\n"
-            "[INFO] 2024-01-15 15:47:05 user-service Cache hit rate: 94% (healthy)\n"
-            "[INFO] 2024-01-15 15:03:22 user-service Deployment v1.5.0 applied successfully\n"
-            "[INFO] 2024-01-15 15:03:18 user-service Startup complete (v1.5.0) - no issues\n"
+            "[ERROR] 2024-01-15 15:47:20 user-service RouteCache invalidation spike: 847 misses (v1.5.0 warm-up)\n"
+            "[WARN]  2024-01-15 15:47:18 user-service aggressive cache refresh — v1.5.0 startup behavior\n"
+            "[INFO]  2024-01-15 15:47:15 user-service 1,204 profile requests processed (normal)\n"
+            "[INFO]  2024-01-15 15:47:10 user-service All health checks PASSING (error_rate: 0.03%)\n"
+            "[INFO]  2024-01-15 15:47:05 user-service Cache hit rate: 94% (recovered from startup dip)\n"
+            "[INFO]  2024-01-15 15:03:22 user-service Deployment v1.5.0 applied (44 min before api-gateway spike)\n"
         ),
     },
     "payment-service": {
@@ -171,13 +190,18 @@ DEPLOY_CONFIG = IncidentConfig(
     golden_actions=[("rollback", "api-gateway")],
     action_order_constraints=[],
     weights={
-        "situational": 0.12,
-        "diagnostic": 0.25,
+        "situational": 0.08,      # reduced by 0.04
+        "diagnostic": 0.19,       # reduced by 0.06
         "remediation": 0.28,
-        "time": 0.15,
+        "time": 0.10,             # reduced by 0.05
         "communication": 0.10,
         "anti_patterns": 0.10,
+        "epistemic_quality": 0.08,
+        "workflow_coherence": 0.07,
     },
+    hypothesis_space=DEPLOY_HYPOTHESIS_SPACE,
+    likelihood_table=DEPLOY_LIKELIHOOD_TABLE,
+    true_hypothesis=DEPLOY_TRUE_HYPOTHESIS,
     sla_service="api-gateway",
     sla_metric="error_rate",
 )
@@ -188,7 +212,9 @@ class DeployIncident(BaseIncident):
     def __init__(self, seed: int = 42):
         engine = RewardEngine(DEPLOY_CONFIG)
         metrics = make_deploy_metric_engine()
-        super().__init__(engine, metrics, DEPLOY_CONFIG, seed)
+        belief = BeliefEngine(DEPLOY_HYPOTHESIS_SPACE, DEPLOY_LIKELIHOOD_TABLE, DEPLOY_TRUE_HYPOTHESIS)
+        workflow = WorkflowMachine(root_cause_service="api-gateway")
+        super().__init__(engine, metrics, DEPLOY_CONFIG, belief, workflow, seed)
         self._rolled_back_gateway = False
         self._rolled_back_user_service = False
 
@@ -241,7 +267,22 @@ class DeployIncident(BaseIncident):
 
         svc = service.lower().strip()
         met = (metric or "all").lower().strip()
-        if met == "all":
+
+        # Timing correlation bonus: querying api-gateway error_rate shows the spike timeline
+        if svc == "api-gateway" and met in ("error_rate", "all"):
+            base = self.metric_engine.format_all(svc) if met == "all" else (
+                f"=== LIVE METRICS: {svc} ===\n"
+                f"  error_rate: {self.metric_engine.format_metric(svc, 'error_rate')}"
+            )
+            result = (
+                base + "\n\n"
+                "  TIMELINE CORRELATION:\n"
+                "    error_rate: 12.4%  | baseline: 0.02% | spike_onset: 15:43 UTC\n"
+                "    last_deploy: api-gateway v2.3.1 at 15:42 UTC  ← 1-minute correlation\n"
+                "    previous deploy: api-gateway v2.3.0 at 09:10 UTC (healthy for 6+ hours)\n"
+                "    user-service v1.5.0 at 15:03 UTC (44 min before spike — no correlation)\n"
+            )
+        elif met == "all":
             result = self.metric_engine.format_all(svc)
         else:
             result = f"=== LIVE METRICS: {svc} ===\n  {met}: {self.metric_engine.format_metric(svc, met)}"
@@ -291,10 +332,16 @@ class DeployIncident(BaseIncident):
             )
         elif act == "rollback" and "user-service" in tgt:
             self._rolled_back_user_service = True
+            self._after_fix("rollback", "user-service")
             result = (
-                "user-service rolled back to v1.4.9.\n"
-                "NOTICE: api-gateway alerts still firing. user-service was NOT the cause.\n"
-                "The v1.5.0 deploy had no routing/request handling changes."
+                "user-service rolling back to v1.4.9...\n"
+                "  ROLLBACK DISRUPTION: user-service offline for ~30 seconds during rollback.\n"
+                "  user-service error_rate briefly spiking to 8% (rollback-induced restart).\n"
+                "  [30s later] user-service back online on v1.4.9.\n"
+                "  RESULT: api-gateway error_rate UNCHANGED at 12.4%. Still failing.\n"
+                "  NOTICE: user-service v1.5.0 had only cache changes — NOT the cause of NPE.\n"
+                "  The RouteCache errors in user-service were startup warm-up events, not request failures.\n"
+                "  Root cause is still active. Investigate api-gateway."
             )
         elif act == "scale" and "api-gateway" in tgt:
             result = (
@@ -318,7 +365,7 @@ class DeployIncident(BaseIncident):
             self.reward_engine.wrong_actions_count += 1
 
         final_score, breakdown = self.reward_engine.compute_final_reward(
-            root_cause, self.step_count
+            root_cause, self.step_count, self.belief_engine, self.workflow_machine
         )
         feedback = breakdown.to_feedback()
         self.done = True

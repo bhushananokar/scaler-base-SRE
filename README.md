@@ -30,30 +30,76 @@ Each episode is a production incident. The agent must:
 
 | # | Name | Difficulty | Scenario |
 |---|------|-----------|----------|
-| 1 | `oom-incident` | Easy | **OOM Restart** — `payment-service` heap exhausted by unbounded `TransactionCache`. Red herring: `api-gateway` CPU alert. |
+| 1 | `oom-incident` | Easy | **OOM Restart** — `payment-service` heap exhausted by unbounded `TransactionCache`. Red herring: `api-gateway` CPU+latency alert. |
 | 2 | `bad-deploy-incident` | Medium | **Bad Deploy Rollback** — `api-gateway v2.3.1` removed lazy init, causing NPE on all routes. Two recent deploys — find the right one. |
-| 3 | `cascade-incident` | Hard | **Cascading Failure** — `order-service v4.2.0` leaks DB connections, exhausting `db-pool`, taking down 3 downstream services. Symptom-only restarts recur. |
+| 3 | `cascade-incident` | Hard | **Cascading Failure** — `order-service v4.2.0` leaks DB connections, exhausting `db-pool`, taking down 3 downstream services. Ordering fix required. |
+| 4 | `config-drift-incident` | Medium-Hard | **Config Drift** — `payments-gateway` TLS cert rotated (CN changed); `checkout-service` config stale. Fix is `update_config`, not restart. Red herrings: `redis-session` connection storm (downstream symptom) and `inventory-service` rollback noise. |
+| 5 | `alert-storm-incident` | Hard | **Alert Storm** — 11 alerts; `notification-service v2.8.0` JPA deadlock stops all message consumption; `message-queue` fills (97%); 4 producers back up. Fix order: restart consumer THEN queue. 2 unrelated red herrings. |
 
-## Reward System (6 Dimensions)
+## Reward System (8 Dimensions)
 
-| Dimension | What it measures |
-|-----------|-----------------|
-| **D1 Situational Awareness** | Alert ack, blast radius mapping, investigation depth |
-| **D2 Diagnostic Quality** | Root cause ID, efficiency, red-herring resistance |
-| **D3 Remediation Quality** | Correct fix, right ordering, fix verification |
-| **D4 Time Efficiency** | MTTD/MTTR — live metrics degrade every step |
-| **D5 Communication** | Status update cadence and resolution accuracy |
-| **D6 Anti-patterns** | Penalties: blind restart, circular queries, wrong service |
+| Dimension | Weight | What it measures |
+|-----------|--------|-----------------|
+| **D1 Situational Awareness** | ~0.06–0.08 | Alert ack, blast radius mapping, investigation depth |
+| **D2 Diagnostic Quality** | ~0.14–0.22 | Root cause ID, efficiency, red-herring resistance |
+| **D3 Remediation Quality** | ~0.22–0.35 | Correct fix, right ordering, fix verification |
+| **D4 Time Efficiency** | 0.10 | MTTD/MTTR — live metrics degrade every step |
+| **D5 Communication** | 0.10 | Status update cadence and resolution accuracy |
+| **D6 Anti-patterns** | 0.10–0.13 | Penalties: blind restart, circular queries, wrong service |
+| **D7 Epistemic Quality** | 0.08 | Bayesian entropy reduction over root cause hypotheses |
+| **D8 Workflow Coherence** | 0.07 | SRE phase-sequence adherence machine |
 
 Per-step rewards (~30%) are returned on every `env.step()`. Episode-end reward (~70%) triggers at `declare_resolved`.
 
+---
+
+## Reward Design Innovation
+
+### D7 — Epistemic Bayesian Reward Signal
+
+The environment maintains a **hidden belief distribution** over a fixed set of competing root cause hypotheses per incident (e.g. `oom:payment-service`, `bad_deploy:payment-service`, `red_herring:api-gateway-cpu`). At episode start the prior is uniform — the agent knows nothing except the alert list.
+
+Each investigation action (query_logs, query_metrics, read_runbook, check_deploy_history) triggers a **Bayesian update**: the engine multiplies the current distribution by hand-authored likelihood weights `P(observing this tool+result | hypothesis is true)`, then renormalizes. The **per-step reward is the Shannon entropy reduction** — how much the agent's uncertainty over root causes sharpened from this single action, normalized to [0, 1] and scaled to ~0.01–0.04.
+
+Key properties:
+- **Redundant queries earn near-zero reward**: if the same `tool:service` key was already called, likelihood weights are shrunk by 90%, so the posterior barely moves
+- **Confidence gate**: `belief_engine.is_confident_enough(threshold=0.65)` is checked before remediation; acting before confidence is below this threshold counts as premature
+- **Final confidence score** (episode-end): probability mass on the true hypothesis at `declare_resolved` time contributes to D7
+
+### D8 — SRE Workflow Coherence Machine
+
+A **finite state machine** tracks which phase of the SRE investigation workflow the agent is in:
+
+```
+OBSERVE → HYPOTHESIZE → DIAGNOSE → REMEDIATE → VERIFY
+```
+
+| Phase | Entry condition | Reward |
+|-------|----------------|--------|
+| HYPOTHESIZE | First query tool called | +0.02 |
+| DIAGNOSE | Root cause service specifically investigated | +0.03 |
+| REMEDIATE | Correct remediation applied after diagnosis | +0.03 |
+| VERIFY | Metrics/logs queried after remediation | +0.02 |
+
+Violations are penalized:
+- Remediating from `OBSERVE` (no investigation): **−0.05**
+- Declaring resolved before `VERIFY`: **−0.04** + `fix_verification` score zeroed in D3
+
+The machine's current state is surfaced in every observation as `workflow_phase` (string) and `epistemic_confidence` (float), making the agent's own reasoning state explicit and learnable.
+
+**Why this matters**: agents are rewarded not just for *what* they discover, but for *how methodically* they discover it. This prevents reward hacking where an agent guesses the correct fix immediately without evidence.
+
+---
+
 **Baseline scores (optimal path):**
 
-| Task | Optimal | Blind Restart | Red Herring Trap |
-|------|---------|--------------|-----------------|
-| T1 OOM | 0.794 | 0.195 | — |
-| T2 Bad Deploy | 0.732 | — | 0.283 |
-| T3 Cascade | 0.734 | — | 0.000 |
+| Task | Score | D7 Epistemic | D8 Workflow |
+|------|-------|-------------|------------|
+| T1 OOM | 0.784 | 0.051/0.080 | 0.063/0.070 |
+| T2 Bad Deploy | 0.728 | 0.048/0.080 | 0.070/0.070 |
+| T3 Cascade | 0.736 | 0.048/0.080 | 0.070/0.070 |
+| T4 Config Drift | 0.777 | 0.053/0.080 | 0.070/0.070 |
+| T5 Alert Storm | 0.683 | 0.053/0.100 | 0.070/0.070 |
 
 ## Action Space
 
@@ -76,14 +122,15 @@ All actions use `IncidentAction` with a `tool` field:
 # Install dependencies
 pip install -r requirements.txt
 
-# Run smoke tests (no API key needed)
+# Run smoke tests (no API key needed) — all 5 tasks
 python test_quick.py
 
-# Run the baseline agent
+# Run the baseline agent (single task or all)
 export API_BASE_URL="https://router.huggingface.co/v1"
 export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
 export HF_TOKEN="hf_..."
-python inference.py --task_id all
+python inference.py --task_id all          # tasks 1–5
+python inference.py --task_id 4            # T4 only
 ```
 
 ## Baseline Agent Output Format
@@ -118,7 +165,7 @@ docker run -p 8000:8000 incident-response-env
 ```
 my_env/
 ├── inference.py              # Baseline agent (OpenAI-compatible, strict log format)
-├── test_quick.py             # Smoke tests — optimal path for all 3 tasks
+├── test_quick.py             # Smoke tests — optimal path for all 5 tasks
 ├── models.py                 # IncidentAction + IncidentObservation Pydantic models
 ├── openenv.yaml              # OpenEnv spec
 ├── pyproject.toml
@@ -129,10 +176,14 @@ my_env/
 │   ├── Dockerfile
 │   └── requirements.txt
 └── src/
-    ├── reward_engine.py      # 6D, 23-component reward system
+    ├── reward_engine.py      # 8D, 29-component reward system (D1–D8)
+    ├── belief_engine.py      # D7: Epistemic Bayesian Reward Signal
+    ├── workflow_machine.py   # D8: SRE Workflow Coherence Machine
     ├── metric_engine.py      # Live metric evolution per step
-    ├── incident_base.py      # Base class wiring reward + metric engines
-    ├── oom_incident.py       # Task 1 — OOM
-    ├── deploy_incident.py    # Task 2 — Bad Deploy
-    └── cascade_incident.py   # Task 3 — Cascade
+    ├── incident_base.py      # Base class wiring all engines
+    ├── oom_incident.py          # Task 1 — OOM
+    ├── deploy_incident.py       # Task 2 — Bad Deploy
+    ├── cascade_incident.py      # Task 3 — Cascade
+    ├── config_drift_incident.py # Task 4 — Config Drift (TLS cert CN mismatch)
+    └── alert_storm_incident.py  # Task 5 — Alert Storm (consumer deadlock)
 ```

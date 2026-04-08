@@ -121,6 +121,8 @@ def make_oom_metric_engine() -> MetricEngine:
     payment-service memory leaks at ~1.8%/step.
     At 100%: service crashes, error_rate spikes.
     Restart resets memory to 18%.
+    api-gateway shows elevated CPU (68%) AND elevated latency (1850ms) to be a more
+    convincing red herring — agents must query logs to rule it out, not just metrics.
     """
     initial = {
         "payment-service": ServiceMetrics(
@@ -128,8 +130,10 @@ def make_oom_metric_engine() -> MetricEngine:
             cpu_usage=62.0, requests_per_sec=38.0,
         ),
         "api-gateway": ServiceMetrics(
-            error_rate=0.02, latency_p99=95, memory_usage=41.0,
-            cpu_usage=28.0, requests_per_sec=420.0,
+            # Strengthened red herring: elevated CPU matches alert, plus latency elevation
+            # from slow upstream payment-service responses propagating back
+            error_rate=0.02, latency_p99=1850, memory_usage=41.0,
+            cpu_usage=68.0, requests_per_sec=420.0,
         ),
         "user-service": ServiceMetrics(
             error_rate=0.01, latency_p99=78, memory_usage=38.0,
@@ -207,6 +211,17 @@ def make_deploy_metric_engine() -> MetricEngine:
             import math
             metrics["web-frontend"].cpu_usage = 65.0 + 8.0 * math.sin(step * 0.8)
 
+        # Collateral damage: wrong rollback of user-service causes brief outage
+        if "rollback:user-service" in fixes:
+            us = metrics["user-service"]
+            if step <= 2:
+                # Rollback disruption: user-service offline during rollback
+                us.error_rate = min(8.0, us.error_rate + 4.0)
+                us.latency_p99 = min(5000, us.latency_p99 + 1200)
+            else:
+                # Recovers, but api-gateway still broken
+                us.error_rate = max(0.1, us.error_rate - 1.5)
+
     def sla_ok(metrics: dict[str, ServiceMetrics]) -> bool:
         return metrics["api-gateway"].error_rate < 5.0
 
@@ -250,6 +265,12 @@ def make_cascade_metric_engine() -> MetricEngine:
             error_rate=0.08, latency_p99=220, memory_usage=61.0,
             cpu_usage=78.0, requests_per_sec=2100.0,
         ),
+        "user-auth-service": ServiceMetrics(
+            # New red herring: elevated latency because it also makes DB calls
+            # that are slow due to pool exhaustion — looks like a root cause but is a symptom
+            error_rate=4.2, latency_p99=890, memory_usage=44.0,
+            cpu_usage=31.0, requests_per_sec=182.0,
+        ),
     }
 
     def evolve(metrics: dict[str, ServiceMetrics], step: int, fixes: set[str]) -> None:
@@ -274,6 +295,11 @@ def make_cascade_metric_engine() -> MetricEngine:
                     s.error_rate = max(0.1, s.error_rate - 18.0)
                     s.latency_p99 = max(120, s.latency_p99 - 6000)
                     s.requests_per_sec = min(40, s.requests_per_sec + 8)
+                # user-auth-service also recovers
+                uas = metrics.get("user-auth-service")
+                if uas:
+                    uas.error_rate = max(0.1, uas.error_rate - 2.0)
+                    uas.latency_p99 = max(95, uas.latency_p99 - 200)
             else:
                 # Leak stopped but pool still exhausted; slow drain
                 db.wait_queue = max(0, db.wait_queue - 15)
@@ -286,6 +312,17 @@ def make_cascade_metric_engine() -> MetricEngine:
             for svc in ["payment-service", "inventory-service", "shipping-service"]:
                 s = metrics[svc]
                 s.error_rate = min(99.0, s.error_rate + 0.8)
+            # user-auth-service also degrades (another DB-dependent symptom)
+            uas = metrics.get("user-auth-service")
+            if uas:
+                uas.error_rate = min(30.0, uas.error_rate + 0.5)
+                uas.latency_p99 = min(30000, uas.latency_p99 + 150)
+
+        # Pool scaled BEFORE order fixed: dramatic re-exhaustion to show ordering matters
+        if pool_scaled and not order_fixed:
+            # The leak continues to fill the pool back up visibly
+            db.connections_used = min(200.0, db.connections_used + 15.0)
+            db.wait_queue = min(2000, db.wait_queue + 60)  # net growth after partial drain
 
         # Restarting downstream services: temporary relief only
         for svc in ["payment-service", "inventory-service", "shipping-service"]:
@@ -302,5 +339,176 @@ def make_cascade_metric_engine() -> MetricEngine:
             if metrics[svc].error_rate >= 5.0:
                 return False
         return True
+
+    return MetricEngine(initial, evolve, sla_ok)
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — Config Drift (TLS cert CN mismatch) metric engine factory
+# ---------------------------------------------------------------------------
+
+def make_config_drift_metric_engine() -> MetricEngine:
+    """
+    checkout-service TLS handshake failing because payments-gateway cert was rotated
+    to a new CN. Error rate grows 0.8%/step without fix.
+    update_config:checkout-service = full recovery.
+    restart:checkout-service = temporary ~30% improvement then regresses.
+    """
+    initial = {
+        "checkout-service": ServiceMetrics(
+            error_rate=18.2, latency_p99=8200, memory_usage=45.0,
+            cpu_usage=32.0, requests_per_sec=180.0,
+        ),
+        "payments-gateway": ServiceMetrics(
+            # Healthy — cert rotation completed successfully on gateway side
+            error_rate=0.0, latency_p99=42, memory_usage=38.0,
+            cpu_usage=18.0, requests_per_sec=0.0,
+        ),
+        "inventory-service": ServiceMetrics(
+            # Downstream symptom: reduced checkout flow
+            error_rate=3.2, latency_p99=890, memory_usage=41.0,
+            cpu_usage=28.0, requests_per_sec=85.0,
+        ),
+        "redis-session": ServiceMetrics(
+            # Red herring: session retries from failed checkouts inflate connection count
+            error_rate=0.05, latency_p99=12, memory_usage=52.0,
+            cpu_usage=24.0, connections_used=2840.0,
+        ),
+    }
+
+    def evolve(metrics: dict[str, ServiceMetrics], step: int, fixes: set[str]) -> None:
+        co = metrics["checkout-service"]
+        config_fixed = "update_config:checkout-service" in fixes
+        restarted = "restart:checkout-service" in fixes
+
+        if config_fixed:
+            # Full recovery: TLS mismatch resolved, error rate drops to near-zero
+            co.error_rate = max(0.1, co.error_rate - 9.0)
+            co.latency_p99 = max(120, co.latency_p99 - 2000)
+            co.requests_per_sec = min(220, co.requests_per_sec + 20)
+            metrics["inventory-service"].error_rate = max(0.05, metrics["inventory-service"].error_rate - 1.5)
+            metrics["redis-session"].connections_used = max(200.0, metrics["redis-session"].connections_used - 320.0)
+        elif restarted:
+            # Restart gives temporary improvement (reconnects briefly) then TLS fails again
+            if step <= 2:
+                co.error_rate = max(12.0, co.error_rate - 3.0)
+                co.latency_p99 = max(3000, co.latency_p99 - 1000)
+            else:
+                # TLS mismatch persists — regresses
+                co.error_rate = min(40.0, co.error_rate + 0.8)
+                co.latency_p99 = min(30000, co.latency_p99 + 200)
+        else:
+            # Growing failure as more payment attempts fail
+            co.error_rate = min(40.0, co.error_rate + 0.8)
+            co.latency_p99 = min(30000, co.latency_p99 + 200)
+            co.requests_per_sec = max(80, co.requests_per_sec - 8)
+            metrics["inventory-service"].error_rate = min(15.0, metrics["inventory-service"].error_rate + 0.3)
+            metrics["redis-session"].connections_used = min(3000.0, metrics["redis-session"].connections_used + 80.0)
+
+    def sla_ok(metrics: dict[str, ServiceMetrics]) -> bool:
+        return metrics["checkout-service"].error_rate < 5.0
+
+    return MetricEngine(initial, evolve, sla_ok)
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — Alert Storm (consumer deadlock) metric engine factory
+# ---------------------------------------------------------------------------
+
+def make_alert_storm_metric_engine() -> MetricEngine:
+    """
+    notification-service deadlocked — no messages consumed.
+    message-queue memory fills at +1.2%/step. Queue depth grows +18K/step (stored as /1000).
+    Producer services error rates all elevated.
+    Fix: restart notification-service (stops deadlock) then restart message-queue (clears memory).
+    Order matters: fix consumer BEFORE clearing queue.
+    analytics-service and cdn-proxy are fully unrelated.
+    """
+    initial = {
+        "message-queue": ServiceMetrics(
+            # memory_usage = RabbitMQ heap %, error_rate = % of publish attempts failing
+            # wait_queue = queue depth in thousands (displayed as "847 waiting" = 847K messages)
+            error_rate=92.0, memory_usage=97.0,
+            wait_queue=847.0, connections_used=200.0,
+        ),
+        "notification-service": ServiceMetrics(
+            # Deadlocked internally but HTTP health check passes — looks healthy from outside!
+            # db_connections_acquired = processing_rate (0/min = no consumption)
+            error_rate=0.0, cpu_usage=45.0,
+            db_connections_acquired=0.0,  # processing rate: 0 messages/min
+        ),
+        "order-service": ServiceMetrics(
+            error_rate=34.2, latency_p99=30000, memory_usage=52.0,
+            cpu_usage=78.0, requests_per_sec=148.0,
+        ),
+        "payment-service": ServiceMetrics(
+            error_rate=31.8, latency_p99=30000, memory_usage=41.0,
+            cpu_usage=62.0, requests_per_sec=38.0,
+        ),
+        "email-service": ServiceMetrics(
+            error_rate=28.4, latency_p99=30000, memory_usage=38.0,
+            cpu_usage=55.0, requests_per_sec=240.0,
+        ),
+        "user-service": ServiceMetrics(
+            error_rate=22.1, latency_p99=8200, memory_usage=44.0,
+            cpu_usage=48.0, requests_per_sec=412.0,
+        ),
+        "analytics-service": ServiceMetrics(
+            # Unrelated: disk issue from failed log rotation (72h alert duration)
+            error_rate=0.0, cpu_usage=40.0, memory_usage=55.0,
+        ),
+        "cdn-proxy": ServiceMetrics(
+            # Unrelated: health check flap from network hiccup
+            error_rate=0.02, cpu_usage=12.0, latency_p99=28,
+        ),
+    }
+
+    def evolve(metrics: dict[str, ServiceMetrics], step: int, fixes: set[str]) -> None:
+        notif_fixed = "restart:notification-service" in fixes
+        queue_fixed = "restart:message-queue" in fixes
+        mq = metrics["message-queue"]
+        ns = metrics["notification-service"]
+
+        if notif_fixed:
+            # Consumer deadlock cleared — processing resumes, queue drains
+            ns.db_connections_acquired = min(1200.0, ns.db_connections_acquired + 150.0)  # processing rate recovering
+            mq.wait_queue = max(0, mq.wait_queue - 25)  # queue draining 25K/step
+            mq.memory_usage = max(40.0, mq.memory_usage - 0.8)
+
+            if queue_fixed:
+                # Full recovery: queue cleared, memory freed, producers recover
+                mq.wait_queue = max(0, mq.wait_queue - 150)  # fast drain
+                mq.memory_usage = max(20.0, mq.memory_usage - 8.0)
+                mq.error_rate = max(0.0, mq.error_rate - 25.0)
+                for svc in ["order-service", "payment-service", "email-service", "user-service"]:
+                    s = metrics[svc]
+                    s.error_rate = max(0.1, s.error_rate - 12.0)
+                    s.latency_p99 = max(90, s.latency_p99 - 8000)
+                    s.requests_per_sec = min(s.requests_per_sec + 30, s.requests_per_sec + 30)
+        elif queue_fixed and not notif_fixed:
+            # Wrong order: cleared queue but consumer still deadlocked
+            # Queue refills because notification-service still not consuming
+            mq.memory_usage = min(99.0, mq.memory_usage + 0.5)  # memory starts climbing again
+            mq.wait_queue = min(2000, mq.wait_queue + 15)  # queue refilling
+            mq.error_rate = min(99.0, mq.error_rate + 0.8)
+        else:
+            # No fix: queue fills, memory grows, producers timeout
+            mq.memory_usage = min(99.0, mq.memory_usage + 1.2)
+            mq.wait_queue = min(2000, mq.wait_queue + 18)  # 18K messages/step
+            mq.error_rate = min(99.0, mq.error_rate + 0.5)
+            for svc in ["order-service", "payment-service", "email-service", "user-service"]:
+                s = metrics[svc]
+                s.error_rate = min(99.0, s.error_rate + 0.8)
+
+        # Restarting individual producers: temporary but errors return when queue stays full
+        for svc in ["order-service", "payment-service", "email-service", "user-service"]:
+            fix_key = f"restart:{svc}"
+            if fix_key in fixes and not notif_fixed:
+                s = metrics[svc]
+                if step <= 2:
+                    s.error_rate = max(5.0, s.error_rate - 15.0)  # brief relief
+
+    def sla_ok(metrics: dict[str, ServiceMetrics]) -> bool:
+        return metrics["payment-service"].error_rate < 5.0
 
     return MetricEngine(initial, evolve, sla_ok)

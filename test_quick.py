@@ -77,8 +77,52 @@ def task3():
             print(" ", line)
 
 
+def task4():
+    print("\n=== TASK 4: Config Drift / TLS Cert CN Mismatch (Medium-Hard) ===")
+    env = IncidentResponseEnvironment()
+    env.reset(task_id=4)
+    step(env, tool="list_alerts")
+    step(env, tool="query_logs", service="checkout-service", severity="error")
+    step(env, tool="query_logs", service="payments-gateway", severity="all")
+    step(env, tool="check_deploy_history", service="payments-gateway")
+    step(env, tool="read_runbook", topic="tls")
+    step(env, tool="execute_remediation", action_type="update_config", target="checkout-service")
+    step(env, tool="query_metrics", service="checkout-service")
+    step(env, tool="update_status", message="TLS CN mismatch: payments-gateway cert rotated, checkout-service config updated to new CN payments-gw-v2.internal")
+    obs = step(env, tool="declare_resolved",
+               root_cause="payments-gateway TLS certificate rotated at 09:12 UTC changing CN from payments-gw-v1.internal to payments-gw-v2.internal; checkout-service config updated via update_config to reference new CN")
+    print(f"\nFINAL SCORE: {obs.reward:.3f}/1.000")
+    for line in obs.content.splitlines():
+        if line.startswith(("[D", "Final", "===", "Excell", "Good", "Outstand", "Tip", "Warn")):
+            print(" ", line)
+
+
+def task5():
+    print("\n=== TASK 5: Alert Storm / Consumer Deadlock (Hard) ===")
+    env = IncidentResponseEnvironment()
+    env.reset(task_id=5)
+    step(env, tool="list_alerts")
+    step(env, tool="query_logs", service="message-queue", severity="error")
+    step(env, tool="query_logs", service="notification-service", severity="error")
+    step(env, tool="check_deploy_history", service="notification-service")
+    step(env, tool="query_metrics", service="message-queue")
+    step(env, tool="read_runbook", topic="notification-service")
+    step(env, tool="update_status", message="Root cause: notification-service v2.8.0 deadlock consuming 0 msgs/min. Fixing consumer first then clearing queue.")
+    step(env, tool="execute_remediation", action_type="restart", target="notification-service")
+    step(env, tool="execute_remediation", action_type="restart", target="message-queue")
+    step(env, tool="query_metrics", service="message-queue")
+    obs = step(env, tool="declare_resolved",
+               root_cause="notification-service v2.8.0 JPA transaction deadlock blocked all consumer threads causing message-queue to fill (847K depth, 97% memory) and 4 producer services to back up; restarted notification-service to clear deadlock then restarted message-queue to drain queue and restore producers")
+    print(f"\nFINAL SCORE: {obs.reward:.3f}/1.000")
+    for line in obs.content.splitlines():
+        if line.startswith(("[D", "Final", "===", "Excell", "Good", "Outstand", "Tip", "Warn")):
+            print(" ", line)
+
+
 if __name__ == "__main__":
     task1()
     task2()
     task3()
+    task4()
+    task5()
     print("\n\nAll tasks complete.")

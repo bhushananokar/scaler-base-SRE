@@ -10,7 +10,12 @@ takes significantly longer. The SLA clock ticks aggressively.
 
 Red herrings:
   1. web-frontend CPU at 78% — marketing campaign, completely unrelated
-  2. payment-service v3.8.2 deployed 2 days ago — red herring; healthy
+  2. user-auth-service latency p99=890ms — also a DB-dependent service, so it's slow
+     too, but investigating it just shows the same DB timeout pattern as payment/inventory.
+     Must be investigated to rule out (logs show no unique root cause there)
+
+Bug fix: payment-service is now only in relevant_services (symptom to investigate),
+NOT in red_herring_services. The previous dual-role caused reward grader contradiction.
 
 The trap: restarting downstream services (payment, inventory, shipping) gives
 temporary relief (they reconnect briefly) but fail again within 2 steps as
@@ -40,6 +45,12 @@ Ordering constraint: restart order-service (idx 0) before scale db-pool (idx 1)
 from .incident_base import BaseIncident
 from .reward_engine import RewardEngine, IncidentConfig
 from .metric_engine import make_cascade_metric_engine
+from .belief_engine import (
+    BeliefEngine,
+    CASCADE_HYPOTHESIS_SPACE, CASCADE_TRUE_HYPOTHESIS, CASCADE_LIKELIHOOD_TABLE,
+)
+# Note: CASCADE_* tables now use user-auth-service as red herring (payment-service removed)
+from .workflow_machine import WorkflowMachine
 
 _DB_TIMEOUT = (
     "DB connection timeout: could not acquire connection from pool\n"
@@ -48,7 +59,7 @@ _DB_TIMEOUT = (
 )
 
 _INITIAL_ALERTS = """
-=== FIRING ALERTS (8 active) ===
+=== FIRING ALERTS (9 active) ===
 [CRITICAL] payment-service   | ErrorRate       | 89.2% | threshold: 5%    | duration: 12m | RISING
 [CRITICAL] inventory-service | ErrorRate       | 91.4% | threshold: 5%    | duration: 11m | RISING
 [CRITICAL] shipping-service  | ErrorRate       | 87.8% | threshold: 5%    | duration: 10m | RISING
@@ -57,6 +68,7 @@ _INITIAL_ALERTS = """
 [HIGH]     payment-service   | Latency_P99     | 30000ms (timeout)        | duration: 12m
 [HIGH]     inventory-service | Latency_P99     | 30000ms (timeout)        | duration: 11m
 [MEDIUM]   order-service     | DBConnectionRate| 340/min | threshold: 50/min | duration: 15m
+[MEDIUM]   user-auth-service | Latency_P99     | 890ms | threshold: 500ms | duration: 9m  | RISING
 [LOW]      web-frontend      | CPUUsage        | 78%   | threshold: 70%   | duration: 20m | flapping
 """
 
@@ -137,6 +149,28 @@ _LOGS = {
         "error": "No errors in web-frontend. CPU is marketing campaign traffic.\n",
         "warn": "[WARN] 2024-01-15 16:18:00 web-frontend CPU 78% (expected: winter-sale campaign)\n",
     },
+    "user-auth-service": {
+        # Subtler red herring: DB-dependent service showing elevated latency due to pool exhaustion.
+        # Logs show same DB timeout pattern as other downstream services — it IS a symptom, not root cause.
+        # Requires one investigation step to rule out: logs show no unique error, just DB timeouts.
+        "error": (
+            f"[ERROR] 2024-01-15 16:18:44 user-auth-service {_DB_TIMEOUT}\n"
+            f"[ERROR] 2024-01-15 16:18:40 user-auth-service {_DB_TIMEOUT} (x34 last 60s)\n"
+            "[ERROR] 2024-01-15 16:18:35 user-auth-service Token validation failing: DB unreachable\n"
+            "[INFO]  2024-01-15 16:07:00 user-auth-service Normal operation (DB latency: 8ms)\n"
+            "NOTE: All errors are DB connection timeouts (same root cause as other downstream services).\n"
+            "      user-auth-service itself has no code issues — it's a victim of pool exhaustion.\n"
+        ),
+        "all": (
+            "[ERROR] 2024-01-15 16:18:44 user-auth-service DB connection timeout: pool exhausted (x34/min)\n"
+            "[INFO]  2024-01-15 16:18:40 user-auth-service Service health: degraded (DB-dependent)\n"
+            "[INFO]  2024-01-15 16:07:00 user-auth-service Normal operation — issue started at 16:04\n"
+        ),
+        "warn": (
+            "[WARN] 2024-01-15 16:18:00 user-auth-service DB connection wait time elevated: 890ms p99\n"
+            "[WARN] 2024-01-15 16:08:00 user-auth-service DB pool wait time rising — investigate db-pool\n"
+        ),
+    },
 }
 
 _RUNBOOKS = {
@@ -209,6 +243,16 @@ _DEPLOY_HISTORY = {
         "=== DEPLOY HISTORY: db-pool ===\n"
         "No changes in 14 days. db-pool configuration is stable.\n"
     ),
+    "web-frontend": (
+        "=== DEPLOY HISTORY: web-frontend ===\n"
+        "2024-01-10 09:00 | v6.1.0 | carol | ACTIVE  | 5 days ago, stable (winter-sale campaign support)\n"
+    ),
+    "user-auth-service": (
+        "=== DEPLOY HISTORY: user-auth-service ===\n"
+        "2024-01-12 14:30 | v3.2.1 | ivan  | ACTIVE  | 3 days ago, stable (token refresh improvements)\n"
+        "2024-01-10 09:00 | v3.2.0 | julia | RETIRED | minor security patch\n"
+        "NOTE: No recent changes. Latency is caused by db-pool exhaustion, not this service.\n"
+    ),
 }
 
 CASCADE_CONFIG = IncidentConfig(
@@ -217,22 +261,27 @@ CASCADE_CONFIG = IncidentConfig(
     root_cause_service="order-service",
     root_cause_type="connection_leak",
     root_cause_keywords=["order-service", "connection", "leak", "db-pool", "v4.2", "async", "exhaust"],
-    all_services=["order-service", "db-pool", "payment-service", "inventory-service", "shipping-service", "web-frontend"],
+    all_services=["order-service", "db-pool", "payment-service", "inventory-service", "shipping-service", "web-frontend", "user-auth-service"],
     relevant_services=["db-pool", "order-service", "payment-service"],
-    red_herring_services=["web-frontend", "payment-service"],  # payment-service is a symptom, not root cause
+    red_herring_services=["web-frontend", "user-auth-service"],  # BUG FIX: payment-service removed; user-auth-service is a new subtler red herring
     golden_actions=[
         ("restart", "order-service"),  # index 0: stop the leak
         ("scale", "db-pool"),          # index 1: clear the queue
     ],
     action_order_constraints=[(0, 1)],  # restart order-service BEFORE scaling db-pool
     weights={
-        "situational": 0.12,
-        "diagnostic": 0.28,
+        "situational": 0.08,      # reduced by 0.04
+        "diagnostic": 0.22,       # reduced by 0.06
         "remediation": 0.22,
-        "time": 0.15,
+        "time": 0.10,             # reduced by 0.05
         "communication": 0.10,
         "anti_patterns": 0.13,
+        "epistemic_quality": 0.08,
+        "workflow_coherence": 0.07,
     },
+    hypothesis_space=CASCADE_HYPOTHESIS_SPACE,
+    likelihood_table=CASCADE_LIKELIHOOD_TABLE,
+    true_hypothesis=CASCADE_TRUE_HYPOTHESIS,
     sla_service="payment-service",
     sla_metric="error_rate",
 )
@@ -243,7 +292,9 @@ class CascadeIncident(BaseIncident):
     def __init__(self, seed: int = 42):
         engine = RewardEngine(CASCADE_CONFIG)
         metrics = make_cascade_metric_engine()
-        super().__init__(engine, metrics, CASCADE_CONFIG, seed)
+        belief = BeliefEngine(CASCADE_HYPOTHESIS_SPACE, CASCADE_LIKELIHOOD_TABLE, CASCADE_TRUE_HYPOTHESIS)
+        workflow = WorkflowMachine(root_cause_service="order-service")
+        super().__init__(engine, metrics, CASCADE_CONFIG, belief, workflow, seed)
         self._order_fixed = False
         self._pool_scaled = False
         self._downstream_restart_count = 0
@@ -371,11 +422,14 @@ class CascadeIncident(BaseIncident):
             else:
                 result = (
                     "SUCCESS: db-pool scaled to 400 connections.\n"
-                    "  Wait queue draining: 847 -> 0\n"
-                    "  Downstream services recovering temporarily.\n"
-                    "  WARNING: order-service v4.2.0 still leaking at 340/min.\n"
-                    "  Pool will re-exhaust in ~5 minutes unless leak is fixed.\n"
-                    "  Recommend: execute_remediation(restart, order-service)"
+                    "  Wait queue clearing: 847 -> 0 initially... but watch what happens next:\n"
+                    "  [+1 step] db-pool connections: 180/400 — order-service still leaking!\n"
+                    "  [+2 step] db-pool connections: 200/400, wait_queue growing again\n"
+                    "  CRITICAL WARNING: order-service v4.2.0 still acquiring connections at 340/min.\n"
+                    "  At this rate, pool will re-exhaust in ~3 minutes.\n"
+                    "  Downstream recovery is TEMPORARY — error rates will climb back to 90%.\n"
+                    "  You MUST restart order-service first to stop the leak.\n"
+                    "  Recommend: execute_remediation(restart, order-service) IMMEDIATELY"
                 )
         elif act == "restart" and is_downstream:
             self._downstream_restart_count += 1
@@ -414,7 +468,7 @@ class CascadeIncident(BaseIncident):
             self.reward_engine.wrong_actions_count += self._downstream_restart_count
 
         final_score, breakdown = self.reward_engine.compute_final_reward(
-            root_cause, self.step_count
+            root_cause, self.step_count, self.belief_engine, self.workflow_machine
         )
         feedback = breakdown.to_feedback()
         self.done = True
