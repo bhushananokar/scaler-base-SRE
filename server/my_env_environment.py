@@ -132,15 +132,16 @@ class IncidentResponseEnvironment(Environment):
                 metadata={"tool": tool, "final": True},
             )
 
+        clamped_reward = max(0.001, min(0.999, round(step_reward, 4)))
         return IncidentObservation(
             content=result,
             task_id=self._incident.get_task_id(),
             step_count=self._state.step_count,
             done=False,
-            reward=round(step_reward, 4),
+            reward=clamped_reward,
             workflow_phase=wf_phase,
             epistemic_confidence=ep_confidence,
-            metadata={"tool": tool, "step_reward": round(step_reward, 4)},
+            metadata={"tool": tool, "step_reward": clamped_reward},
         )
 
     def _dispatch(self, tool: str, action: IncidentAction) -> tuple[str, float]:
