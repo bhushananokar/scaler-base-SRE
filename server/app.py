@@ -38,12 +38,17 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import IncidentAction, IncidentObservation
     from .my_env_environment import IncidentResponseEnvironment
+    from .demo_ui import build_demo
 except ImportError:
     from models import IncidentAction, IncidentObservation
     from server.my_env_environment import IncidentResponseEnvironment
+    from server.demo_ui import build_demo
 
+import gradio as gr
+from fastapi import Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-# Create the app with web interface and README integration
+# Create the FastAPI app
 app = create_app(
     IncidentResponseEnvironment,
     IncidentAction,
@@ -51,6 +56,18 @@ app = create_app(
     env_name="incident_response_env",
     max_concurrent_envs=10,
 )
+
+# Root: redirect browsers to /ui/ but pass through HF internal probes (?logs=...)
+@app.get("/", include_in_schema=False)
+async def root_redirect(request: Request):
+    # HF Spaces probes /?logs=container for health — let those through as 200
+    if request.query_params:
+        return HTMLResponse("ok", status_code=200)
+    return RedirectResponse(url="/ui/", status_code=302)
+
+# Mount the interactive demo UI at /ui
+demo = build_demo()
+app = gr.mount_gradio_app(app, demo, path="/ui")
 
 
 def main():
