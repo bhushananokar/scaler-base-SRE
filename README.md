@@ -1,3 +1,13 @@
+---
+title: NRG Meta Submission
+emoji: 🚨
+colorFrom: red
+colorTo: red
+sdk: docker
+pinned: false
+tags:
+  - openenv
+---
 # AI-Powered Incident Response Triage Environment
 
 An [OpenEnv](https://github.com/meta-pytorch/OpenEnv) environment that trains AI agents to triage and resolve production incidents. The agent plays the role of an on-call SRE, using investigation tools to find the root cause and apply the correct remediation.

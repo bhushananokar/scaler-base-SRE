@@ -105,7 +105,7 @@ class RewardBreakdown:
 
     @property
     def total(self) -> float:
-        """Sum of all dimension scores, clamped to [0, 1]."""
+        """Sum of all dimension scores, clamped to (0.001, 0.999)."""
         raw = (
             self.situational
             + self.diagnostic
@@ -116,13 +116,13 @@ class RewardBreakdown:
             + self.epistemic_quality
             + self.workflow_coherence
         )
-        return max(0.0, min(1.0, raw))
+        return max(0.001, min(0.999, raw))
 
     def to_feedback(self) -> str:
         """Return a multi-line human-readable breakdown string."""
         lines: list[str] = []
         lines.append("=== INCIDENT RESOLVED ===")
-        lines.append(f"Final Score: {self.total:.3f}/1.000")
+        lines.append(f"Final Score: {max(0.001, min(0.999, self.total)):.3f}/1.000")
         lines.append("")
 
         # Helper to look up component values safely
@@ -474,7 +474,7 @@ class RewardEngine:
         Returns
         -------
         (final_score, breakdown)
-            final_score is in [0.0, 1.0], rounded to 3 decimal places.
+            final_score is in (0.001, 0.999), rounded to 3 decimal places.
         """
         cfg = self.config
         w = cfg.weights
@@ -824,7 +824,7 @@ class RewardEngine:
             + bd.epistemic_quality
             + bd.workflow_coherence
         )
-        final_score = round(max(0.0, min(1.0, episode_score)), 3)
+        final_score = round(max(0.001, min(0.999, episode_score)), 3)
         return final_score, bd
 
 

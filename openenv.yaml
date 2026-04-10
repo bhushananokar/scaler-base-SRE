@@ -83,7 +83,7 @@ observation_space:
     epistemic_confidence:  {type: number, nullable: true,
                             description: "Probability mass on top root cause hypothesis (0.0–1.0). Remediate when >= 0.65."}
 
-reward_range: [0.0, 1.0]
+reward_range: [0.001, 0.999]
 
 reward_dimensions:
   - name: situational_awareness

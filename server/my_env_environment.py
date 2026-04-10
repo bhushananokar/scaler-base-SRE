@@ -8,7 +8,6 @@ get immediate feedback rather than waiting for the terminal step.
 At declare_resolved, `done=True` and `reward` = final normalized score (0–1).
 """
 
-import re
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -95,7 +94,7 @@ class IncidentResponseEnvironment(Environment):
             task_id=task_id,
             step_count=0,
             done=False,
-            reward=0.0,
+            reward=None,
             metadata={"status": "incident_opened", "task_id": task_id},
         )
 
@@ -107,7 +106,7 @@ class IncidentResponseEnvironment(Environment):
         if self._incident is None:
             return IncidentObservation(
                 content="No active incident. Call reset() with task_id first.",
-                done=False, reward=0.0, task_id=0, step_count=0,
+                done=False, reward=None, task_id=0, step_count=0,
             )
 
         self._state.step_count += 1
@@ -120,9 +119,8 @@ class IncidentResponseEnvironment(Environment):
 
         done = self._incident.done
         if done:
-            # Extract final score from reward breakdown text
-            match = re.search(r"Final Score: ([\d.]+)", result)
-            final_reward = float(match.group(1)) if match else 0.0
+            # step_reward is already the clamped final score from compute_final_reward()
+            final_reward = max(0.001, min(0.999, float(step_reward)))
             return IncidentObservation(
                 content=result,
                 task_id=self._incident.get_task_id(),

@@ -1,21 +1,22 @@
 """
-Inference Script — Incident Response Triage Environment
-========================================================
+Remote Inference Script — Incident Response Triage Environment
+==============================================================
+Identical agent logic to inference.py but uses the deployed HF Space
+via IncidentResponseEnv (WebSocket client) instead of the local env.
+
 MANDATORY ENVIRONMENT VARIABLES:
     API_BASE_URL   The OpenAI-compatible API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
     HF_TOKEN       Your Hugging Face / API key.
-
-Defaults (active HF inference endpoint):
-    API_BASE_URL = "https://router.huggingface.co/v1"
-    MODEL_NAME   = "Qwen/Qwen2.5-72B-Instruct"
+    ENV_URL        The deployed environment URL (default: HF Space URL).
 
 Usage:
-    python inference.py
-    python inference.py --task_id 1       # single task
-    python inference.py --task_id all     # all 3 tasks (default)
+    python inference_remote.py
+    python inference_remote.py --task_id 1       # single task
+    python inference_remote.py --task_id all     # all 5 tasks (default)
+    python inference_remote.py --env_url https://your-space.hf.space
 
-STDOUT FORMAT (strictly followed for automated evaluation):
+STDOUT FORMAT:
     [START] task=<name> env=incident_response_env model=<model>
     [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
     [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>
@@ -33,9 +34,30 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=True)
 sys.path.insert(0, os.path.dirname(__file__))
 
 from openai import OpenAI
+import importlib, types
 
-from server.my_env_environment import IncidentResponseEnvironment
-from models import IncidentAction
+# client.py uses relative imports; load it with a package context
+_pkg = types.ModuleType("_incident_pkg")
+_pkg.__path__ = [os.path.dirname(__file__)]
+_pkg.__package__ = "_incident_pkg"
+import sys as _sys
+_sys.modules["_incident_pkg"] = _pkg
+
+import importlib.util as _ilu
+
+def _load(name, path):
+    spec = _ilu.spec_from_file_location(name, path, submodule_search_locations=[])
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_base = os.path.dirname(__file__)
+_models_mod = _load("_incident_pkg.models", os.path.join(_base, "models.py"))
+_client_mod  = _load("_incident_pkg.client",  os.path.join(_base, "client.py"))
+
+IncidentResponseEnv = _client_mod.IncidentResponseEnv
+IncidentAction      = _models_mod.IncidentAction
 
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables
@@ -43,8 +65,9 @@ from models import IncidentAction
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "gpt-4o-mini")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY", "placeholder")
+DEFAULT_ENV_URL = "https://ghost14504-nrg-meta-submission.hf.space"
 
-SUCCESS_SCORE_THRESHOLD = 0.50   # score >= this => success
+SUCCESS_SCORE_THRESHOLD = 0.50
 
 TASK_NAMES = {
     1: "oom-incident",
@@ -54,7 +77,6 @@ TASK_NAMES = {
     5: "alert-storm-incident",
 }
 
-# Per-task step budgets (T5 is harder — allow more steps)
 TASK_MAX_STEPS = {
     1: 15, 2: 15, 3: 15, 4: 15, 5: 20,
 }
@@ -205,7 +227,7 @@ Rules:
 """
 
 # ---------------------------------------------------------------------------
-# Logging helpers (strict format required by evaluator)
+# Logging helpers
 # ---------------------------------------------------------------------------
 def log_start(task: str, model: str) -> None:
     print(f"[START] task={task} env=incident_response_env model={model}", flush=True)
@@ -228,7 +250,6 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 
 def _action_str(tool_name: str, args: dict) -> str:
-    """Compact string representation for the [STEP] action field."""
     if not args:
         return f"{tool_name}()"
     parts = ",".join(f"{k}={v}" for k, v in args.items())
@@ -236,10 +257,9 @@ def _action_str(tool_name: str, args: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM call (OpenAI client, tool-calling)
+# LLM call
 # ---------------------------------------------------------------------------
 def call_llm(client: OpenAI, messages: list) -> Optional[dict]:
-    """Call the LLM and return {'content': str, 'tool_calls': list}."""
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -272,117 +292,114 @@ def call_llm(client: OpenAI, messages: list) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Episode runner
+# Episode runner — uses remote EnvClient
 # ---------------------------------------------------------------------------
-def run_episode(client: OpenAI, task_id: int) -> dict:
+def run_episode(llm_client: OpenAI, task_id: int, env_url: str) -> dict:
     task_name = TASK_NAMES[task_id]
     max_steps = TASK_MAX_STEPS.get(task_id, 15)
     log_start(task=task_name, model=MODEL_NAME)
-
-    env = IncidentResponseEnvironment()
-    obs = env.reset(task_id=task_id)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"INCIDENT BRIEFING:\n{obs.content}\n\n"
-                "Begin your investigation. Call list_alerts first."
-            ),
-        },
-    ]
 
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
     success = False
     done = False
-    last_error: Optional[str] = None
 
-    try:
-        for step in range(1, max_steps + 1):
-            if done:
-                break
+    with IncidentResponseEnv(base_url=env_url).sync() as env:
+        reset_result = env.reset(task_id=task_id)
+        obs = reset_result.observation
 
-            response = call_llm(client, messages)
-            if response is None:
-                last_error = "LLM returned no response"
-                log_step(step, "none()", 0.0, False, last_error)
-                rewards.append(0.0)
-                steps_taken = step
-                break
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"INCIDENT BRIEFING:\n{obs.content}\n\n"
+                    "Begin your investigation. Call list_alerts first."
+                ),
+            },
+        ]
 
-            tool_calls = response.get("tool_calls", [])
-            content = response.get("content", "")
-
-            if not tool_calls:
-                # Model stopped calling tools — treat as stuck
-                last_error = "no_tool_call"
-                log_step(step, "none()", 0.0, False, last_error)
-                rewards.append(0.0)
-                steps_taken = step
-                break
-
-            # Build assistant message (with tool_calls for OpenAI history)
-            assistant_msg: dict = {"role": "assistant", "content": content}
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"])
-                        if isinstance(tc["arguments"], dict)
-                        else tc["arguments"],
-                    },
-                }
-                for tc in tool_calls
-            ]
-            messages.append(assistant_msg)
-
-            # Execute each tool call against the environment
-            tool_result_msgs = []
-            for tc in tool_calls:
-                tool_name = tc["name"]
-                tool_args = tc["arguments"] if isinstance(tc["arguments"], dict) else {}
-
-                try:
-                    known_fields = set(IncidentAction.model_fields.keys())
-                    tool_args = {k: v for k, v in tool_args.items() if k in known_fields}
-                    action = IncidentAction(tool=tool_name, **tool_args)
-                    result_obs = env.step(action)
-                    result_str = result_obs.content
-                    step_reward = result_obs.reward
-                    step_done = result_obs.done
-                    err_str = None
-                except Exception as exc:
-                    result_str = f"Error: {exc}"
-                    step_reward = 0.0
-                    step_done = False
-                    err_str = str(exc)[:80]
-
-                action_repr = _action_str(tool_name, tool_args)
-                log_step(step, action_repr, step_reward, step_done, err_str)
-                rewards.append(step_reward)
-                steps_taken = step
-
-                tool_result_msgs.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result_str,
-                })
-
-                if step_done:
-                    done = True
-                    score = step_reward          # final reward at declare_resolved
-                    success = score >= SUCCESS_SCORE_THRESHOLD
+        try:
+            for step in range(1, max_steps + 1):
+                if done:
                     break
 
-            messages.extend(tool_result_msgs)
+                response = call_llm(llm_client, messages)
+                if response is None:
+                    last_error = "LLM returned no response"
+                    log_step(step, "none()", 0.0, False, last_error)
+                    rewards.append(0.0)
+                    steps_taken = step
+                    break
 
-    finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+                tool_calls = response.get("tool_calls", [])
+                content = response.get("content", "")
+
+                if not tool_calls:
+                    last_error = "no_tool_call"
+                    log_step(step, "none()", 0.0, False, last_error)
+                    rewards.append(0.0)
+                    steps_taken = step
+                    break
+
+                assistant_msg: dict = {"role": "assistant", "content": content}
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["arguments"])
+                            if isinstance(tc["arguments"], dict)
+                            else tc["arguments"],
+                        },
+                    }
+                    for tc in tool_calls
+                ]
+                messages.append(assistant_msg)
+
+                tool_result_msgs = []
+                for tc in tool_calls:
+                    tool_name = tc["name"]
+                    tool_args = tc["arguments"] if isinstance(tc["arguments"], dict) else {}
+
+                    try:
+                        known_fields = set(IncidentAction.model_fields.keys())
+                        tool_args = {k: v for k, v in tool_args.items() if k in known_fields}
+                        action = IncidentAction(tool=tool_name, **tool_args)
+                        result = env.step(action)
+                        result_str = result.observation.content
+                        step_reward = result.reward or 0.0
+                        step_done = result.done
+                        err_str = None
+                    except Exception as exc:
+                        result_str = f"Error: {exc}"
+                        step_reward = 0.0
+                        step_done = False
+                        err_str = str(exc)[:80]
+
+                    action_repr = _action_str(tool_name, tool_args)
+                    log_step(step, action_repr, step_reward, step_done, err_str)
+                    rewards.append(step_reward)
+                    steps_taken = step
+
+                    tool_result_msgs.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_str,
+                    })
+
+                    if step_done:
+                        done = True
+                        score = step_reward
+                        success = score >= SUCCESS_SCORE_THRESHOLD
+                        break
+
+                messages.extend(tool_result_msgs)
+
+        finally:
+            log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     return {
         "task_id":   task_id,
@@ -398,17 +415,20 @@ def run_episode(client: OpenAI, task_id: int) -> dict:
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Incident Response — Baseline Inference")
-    parser.add_argument("--task_id", default="all", help="1, 2, 3, 4, 5, or 'all'")
+    parser = argparse.ArgumentParser(description="Remote Incident Response — Inference")
+    parser.add_argument("--task_id",  default="all", help="1-5, or 'all'")
+    parser.add_argument("--env_url",  default=os.getenv("ENV_URL", DEFAULT_ENV_URL),
+                        help="Deployed environment base URL")
     args = parser.parse_args()
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    print(f"[CONFIG] env_url={args.env_url} model={MODEL_NAME}", flush=True)
 
+    llm_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     task_ids = [1, 2, 3, 4, 5] if args.task_id == "all" else [int(args.task_id)]
 
     results = []
     for tid in task_ids:
-        result = run_episode(client, tid)
+        result = run_episode(llm_client, tid, args.env_url)
         results.append(result)
 
     if len(results) > 1:
