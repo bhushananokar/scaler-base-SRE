@@ -244,7 +244,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
 
@@ -301,7 +301,7 @@ def run_episode(llm_client: OpenAI, task_id: int, env_url: str) -> dict:
 
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
+    score = 0.01
     success = False
     done = False
 
@@ -375,7 +375,7 @@ def run_episode(llm_client: OpenAI, task_id: int, env_url: str) -> dict:
                         err_str = None
                     except Exception as exc:
                         result_str = f"Error: {exc}"
-                        step_reward = 0.0
+                        step_reward = 0.01
                         step_done = False
                         err_str = str(exc)[:80]
 
@@ -433,11 +433,11 @@ def main() -> None:
 
     if len(results) > 1:
         avg = sum(r["score"] for r in results) / len(results)
-        print(f"\n[SUMMARY] tasks={len(results)} avg_score={avg:.3f}", flush=True)
+        print(f"\n[SUMMARY] tasks={len(results)} avg_score={avg:.2f}", flush=True)
         for r in results:
             status = "success" if r["success"] else "failed"
             print(
-                f"  task={r['task_name']} status={status} score={r['score']:.3f} steps={r['steps']}",
+                f"  task={r['task_name']} status={status} score={r['score']:.2f} steps={r['steps']}",
                 flush=True,
             )
 

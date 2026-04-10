@@ -120,7 +120,7 @@ class IncidentResponseEnvironment(Environment):
         done = self._incident.done
         if done:
             # step_reward is already the clamped final score from compute_final_reward()
-            final_reward = max(0.001, min(0.999, float(step_reward)))
+            final_reward = max(0.01, min(0.99, float(step_reward)))
             return IncidentObservation(
                 content=result,
                 task_id=self._incident.get_task_id(),
@@ -132,7 +132,7 @@ class IncidentResponseEnvironment(Environment):
                 metadata={"tool": tool, "final": True},
             )
 
-        clamped_reward = max(0.001, min(0.999, round(step_reward, 4)))
+        clamped_reward = max(0.01, min(0.99, round(step_reward, 2)))
         return IncidentObservation(
             content=result,
             task_id=self._incident.get_task_id(),

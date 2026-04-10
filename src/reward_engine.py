@@ -116,13 +116,13 @@ class RewardBreakdown:
             + self.epistemic_quality
             + self.workflow_coherence
         )
-        return max(0.001, min(0.999, raw))
+        return max(0.01, min(0.99, raw))
 
     def to_feedback(self) -> str:
         """Return a multi-line human-readable breakdown string."""
         lines: list[str] = []
         lines.append("=== INCIDENT RESOLVED ===")
-        lines.append(f"Final Score: {max(0.001, min(0.999, self.total)):.3f}/1.000")
+        lines.append(f"Final Score: {max(0.01, min(0.99, self.total)):.2f}/1.00")
         lines.append("")
 
         # Helper to look up component values safely
@@ -824,7 +824,7 @@ class RewardEngine:
             + bd.epistemic_quality
             + bd.workflow_coherence
         )
-        final_score = round(max(0.001, min(0.999, episode_score)), 3)
+        final_score = round(max(0.01, min(0.99, episode_score)), 2)
         return final_score, bd
 
 
